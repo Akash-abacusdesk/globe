@@ -1,11 +1,11 @@
 import RendererSwitch from "@/components/RendererSwitch";
 import GlobalPresence from "@/components/global-presence/GlobalPresence";
 
-export default function Home() {
+export default function WebGLPage() {
   return (
     <main className="flex flex-1 flex-col">
-      <RendererSwitch current="svg" />
-      <GlobalPresence renderer="svg" />
+      <RendererSwitch current="webgl" />
+      <GlobalPresence renderer="webgl" />
     </main>
   );
 }
