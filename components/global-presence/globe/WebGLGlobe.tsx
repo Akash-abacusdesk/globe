@@ -8,7 +8,7 @@ import * as THREE from "three";
 import type { GlobeProps } from "../data/locations";
 import { focusFor, GLOBE_COLORS as C, lerpZoom, loadWorld, shortestAngle, TRANSITION_S, type World } from "../utils/geo";
 
-type Tier = { dpr: [number, number]; segments: number; day: string; clouds: string | null; idle: boolean };
+type Tier = { dpr: [number, number]; segments: number; hiDay: string | null; clouds: boolean; idle: boolean };
 type View = { yaw: number; pitch: number; k: number };
 type LatLon = { latitude: number; longitude: number };
 
@@ -35,11 +35,10 @@ const ease = (t: number) => 1 - (1 - t) ** 5;
 function detectTier(): Tier {
   const cores = navigator.hardwareConcurrency || 4;
   const memory = (navigator as { deviceMemory?: number }).deviceMemory ?? 4;
-  const clouds = `${TEX}/clouds-4096.webp`;
-  if (cores <= 4 || memory <= 2) return { dpr: [1, 1], segments: 48, day: `${TEX}/earth-day-2048.webp`, clouds: null, idle: false };
+  if (cores <= 4 || memory <= 2) return { dpr: [1, 1], segments: 48, hiDay: null, clouds: false, idle: false };
   if (matchMedia("(pointer: coarse)").matches || cores <= 6)
-    return { dpr: [1, 1.25], segments: 64, day: `${TEX}/earth-day-4096.webp`, clouds, idle: true };
-  return { dpr: [1, 1.5], segments: 96, day: `${TEX}/earth-day-8192.webp`, clouds, idle: true };
+    return { dpr: [1, 1.25], segments: 64, hiDay: `${TEX}/earth-day-4096.webp`, clouds: true, idle: true };
+  return { dpr: [1, 1.5], segments: 96, hiDay: `${TEX}/earth-day-8192.webp`, clouds: true, idle: true };
 }
 
 // Same position a SphereGeometry vertex gets for this lat/lon on an equirectangular texture.
@@ -171,20 +170,42 @@ function Scene({ countries, activeCountryId, activeStoreId, hoveredId, inView, r
   const tween = useRef<{ from: View; to: View; start: number } | null>(null);
   const selectedAt = useRef(0);
 
-  const urls = [tier.day, `${TEX}/earth-night-2048.webp`, `${TEX}/earth-water-2048.webp`];
-  if (tier.clouds) urls.push(tier.clouds);
+  // First paint uses the small maps (~0.7MB); the big ones swap in below once the page is idle.
+  const urls = [`${TEX}/earth-day-2048.webp`, `${TEX}/earth-night-2048.webp`, `${TEX}/earth-water-2048.webp`];
+  if (tier.clouds) urls.push(`${TEX}/clouds-2048.webp`);
   const [day, night, water, clouds] = useLoader(THREE.TextureLoader, urls);
   useMemo(() => prepare(Math.min(aniso, 16), day, night, water, clouds), [aniso, day, night, water, clouds]);
-  const cloudMaterial = useMemo(
-    () => new THREE.MeshLambertMaterial({ color: "#ffffff", alphaMap: clouds, transparent: true, depthWrite: false }),
-    [clouds],
-  );
-  useEffect(() => () => cloudMaterial.dispose(), [cloudMaterial]);
+  const [hi, setHi] = useState<{ day: THREE.Texture; clouds?: THREE.Texture } | null>(null);
+  const dayTex = hi?.day ?? day;
+  const cloudTex = hi?.clouds ?? clouds;
 
   const uniforms = useMemo(
-    () => ({ dayMap: { value: day }, nightMap: { value: night }, waterMap: { value: water }, sunDir: { value: SUN } }),
-    [day, night, water],
+    () => ({ dayMap: { value: dayTex }, nightMap: { value: night }, waterMap: { value: water }, sunDir: { value: SUN } }),
+    [dayTex, night, water],
   );
+
+  useEffect(() => {
+    if (!tier.hiDay) return;
+    let dead = false;
+    const loader = new THREE.TextureLoader();
+    const load = () =>
+      Promise.all([loader.loadAsync(tier.hiDay!), tier.clouds ? loader.loadAsync(`${TEX}/clouds-4096.webp`) : undefined]).then(
+        ([hiDay, hiClouds]) => {
+          if (dead) return void (hiDay.dispose(), hiClouds?.dispose());
+          prepare(Math.min(aniso, 16), hiDay, night, water, hiClouds);
+          setHi({ day: hiDay, clouds: hiClouds });
+          day.dispose();
+          clouds?.dispose();
+        },
+        () => {},
+      );
+    const idle = (window as { requestIdleCallback?: (cb: () => void, o?: { timeout: number }) => number }).requestIdleCallback;
+    const id = idle ? idle(load, { timeout: 3000 }) : window.setTimeout(load, 800);
+    return () => {
+      dead = true;
+      if (!idle) clearTimeout(id);
+    };
+  }, [tier, aniso, day, night, water, clouds]);
 
   const highlight = useMemo(() => {
     const canvas = document.createElement("canvas");
@@ -265,7 +286,7 @@ function Scene({ countries, activeCountryId, activeStoreId, hoveredId, inView, r
     if (cloudGroup.current) {
       if (busy && !reducedMotion) cloudGroup.current.rotation.y += dt * CLOUD_DRIFT_RAD_PER_S;
       const opacity = Math.min(Math.max((4 - v.k) / 2.2, 0), 1);
-      cloudMaterial.opacity = opacity;
+      for (const m of cloudGroup.current.children) ((m as THREE.Mesh).material as THREE.MeshLambertMaterial).opacity = opacity;
       cloudGroup.current.visible = opacity > 0.01;
     }
 
@@ -316,14 +337,16 @@ function Scene({ countries, activeCountryId, activeStoreId, hoveredId, inView, r
               </mesh>
             );
           })}
-          {clouds && (
+          {cloudTex && (
             // Two layers of the same map, offset, roughly double the coverage.
             <group ref={cloudGroup}>
-              <mesh scale={1.008} material={cloudMaterial}>
+              <mesh scale={1.008}>
                 <sphereGeometry args={[1, 64, 48]} />
+                <meshLambertMaterial color="#ffffff" alphaMap={cloudTex} transparent depthWrite={false} />
               </mesh>
-              <mesh scale={1.011} rotation={[0, 2.4, 0]} material={cloudMaterial}>
+              <mesh scale={1.011} rotation={[0, 2.4, 0]}>
                 <sphereGeometry args={[1, 64, 48]} />
+                <meshLambertMaterial color="#ffffff" alphaMap={cloudTex} transparent depthWrite={false} />
               </mesh>
             </group>
           )}
@@ -337,8 +360,12 @@ export default function WebGLGlobe({ onReady, ...props }: GlobeProps & { onReady
   const [tier] = useState(detectTier);
   const [world, setWorld] = useState<World | null>(null);
 
+  // Coarse atlas first so the globe paints early; the 50m one replaces it.
   useEffect(() => {
-    loadWorld("50m").then(setWorld);
+    let dead = false;
+    loadWorld("110m").then((w) => dead || setWorld((cur) => cur ?? w));
+    loadWorld("50m").then((w) => dead || setWorld(w));
+    return () => void (dead = true);
   }, []);
 
   if (!world) return null;
