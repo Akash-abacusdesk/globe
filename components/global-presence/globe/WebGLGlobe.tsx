@@ -8,7 +8,7 @@ import * as THREE from "three";
 import type { GlobeProps } from "../data/locations";
 import { focusFor, GLOBE_COLORS as C, lerpZoom, loadWorld, shortestAngle, TRANSITION_S, type World } from "../utils/geo";
 
-type Tier = { dpr: [number, number]; segments: number; day: string; clouds: boolean; idle: boolean };
+type Tier = { dpr: [number, number]; segments: number; day: string; clouds: string | null; idle: boolean };
 type View = { yaw: number; pitch: number; k: number };
 type LatLon = { latitude: number; longitude: number };
 
@@ -35,11 +35,11 @@ const ease = (t: number) => 1 - (1 - t) ** 5;
 function detectTier(): Tier {
   const cores = navigator.hardwareConcurrency || 4;
   const memory = (navigator as { deviceMemory?: number }).deviceMemory ?? 4;
-  const small = `${TEX}/earth-day-2048.webp`;
-  if (cores <= 4 || memory <= 2) return { dpr: [1, 1], segments: 48, day: small, clouds: false, idle: false };
+  const clouds = `${TEX}/clouds-4096.webp`;
+  if (cores <= 4 || memory <= 2) return { dpr: [1, 1], segments: 48, day: `${TEX}/earth-day-2048.webp`, clouds: null, idle: false };
   if (matchMedia("(pointer: coarse)").matches || cores <= 6)
-    return { dpr: [1, 1.25], segments: 64, day: small, clouds: true, idle: true };
-  return { dpr: [1, 1.5], segments: 96, day: `${TEX}/earth-day-4096.webp`, clouds: true, idle: true };
+    return { dpr: [1, 1.25], segments: 64, day: `${TEX}/earth-day-4096.webp`, clouds, idle: true };
+  return { dpr: [1, 1.5], segments: 96, day: `${TEX}/earth-day-8192.webp`, clouds, idle: true };
 }
 
 // Same position a SphereGeometry vertex gets for this lat/lon on an equirectangular texture.
@@ -88,9 +88,9 @@ function paintHighlight(texture: THREE.CanvasTexture, shape: Feature | undefined
   texture.needsUpdate = true;
 }
 
-function prepare(day: THREE.Texture, night: THREE.Texture, water: THREE.Texture, clouds?: THREE.Texture) {
+function prepare(aniso: number, day: THREE.Texture, night: THREE.Texture, water: THREE.Texture, clouds?: THREE.Texture) {
   for (const t of [day, night]) t.colorSpace = THREE.SRGBColorSpace;
-  for (const t of [day, night, water, clouds]) if (t) t.anisotropy = 8;
+  for (const t of [day, night, water, clouds]) if (t) t.anisotropy = aniso;
 }
 
 const earthShader = {
@@ -162,19 +162,24 @@ type SceneProps = GlobeProps & { tier: Tier; world: World; onReady: () => void }
 
 function Scene({ countries, activeCountryId, activeStoreId, hoveredId, inView, reducedMotion, tier, world, onReady }: SceneProps) {
   const invalidate = useThree((s) => s.invalidate);
+  const aniso = useThree((s) => s.gl.capabilities.getMaxAnisotropy());
   const yawGroup = useRef<THREE.Group>(null);
   const pitchGroup = useRef<THREE.Group>(null);
-  const cloudMesh = useRef<THREE.Mesh>(null);
-  const cloudMaterial = useRef<THREE.MeshLambertMaterial>(null);
+  const cloudGroup = useRef<THREE.Group>(null);
   const markerRefs = useRef<(THREE.Mesh | null)[]>([]);
   const view = useRef<View>({ ...facing({ latitude: REST_PITCH, longitude: -10 }), k: 1 });
   const tween = useRef<{ from: View; to: View; start: number } | null>(null);
   const selectedAt = useRef(0);
 
   const urls = [tier.day, `${TEX}/earth-night-2048.webp`, `${TEX}/earth-water-2048.webp`];
-  if (tier.clouds) urls.push(`${TEX}/clouds-2048.webp`);
+  if (tier.clouds) urls.push(tier.clouds);
   const [day, night, water, clouds] = useLoader(THREE.TextureLoader, urls);
-  useMemo(() => prepare(day, night, water, clouds), [day, night, water, clouds]);
+  useMemo(() => prepare(Math.min(aniso, 16), day, night, water, clouds), [aniso, day, night, water, clouds]);
+  const cloudMaterial = useMemo(
+    () => new THREE.MeshLambertMaterial({ color: "#ffffff", alphaMap: clouds, transparent: true, depthWrite: false }),
+    [clouds],
+  );
+  useEffect(() => () => cloudMaterial.dispose(), [cloudMaterial]);
 
   const uniforms = useMemo(
     () => ({ dayMap: { value: day }, nightMap: { value: night }, waterMap: { value: water }, sunDir: { value: SUN } }),
@@ -257,11 +262,11 @@ function Scene({ countries, activeCountryId, activeStoreId, hoveredId, inView, r
     }
 
     // Clouds drift a little faster than the ground and clear away on close-ups.
-    if (cloudMesh.current && cloudMaterial.current) {
-      if (busy && !reducedMotion) cloudMesh.current.rotation.y += dt * CLOUD_DRIFT_RAD_PER_S;
-      const opacity = Math.min(Math.max((3 - v.k) / 1.8, 0), 1) * 0.9;
-      cloudMaterial.current.opacity = opacity;
-      cloudMesh.current.visible = opacity > 0.01;
+    if (cloudGroup.current) {
+      if (busy && !reducedMotion) cloudGroup.current.rotation.y += dt * CLOUD_DRIFT_RAD_PER_S;
+      const opacity = Math.min(Math.max((4 - v.k) / 2.2, 0), 1);
+      cloudMaterial.opacity = opacity;
+      cloudGroup.current.visible = opacity > 0.01;
     }
 
     // Markers keep a constant on-screen size whatever the zoom.
@@ -312,10 +317,15 @@ function Scene({ countries, activeCountryId, activeStoreId, hoveredId, inView, r
             );
           })}
           {clouds && (
-            <mesh ref={cloudMesh} scale={1.008}>
-              <sphereGeometry args={[1, 64, 48]} />
-              <meshLambertMaterial ref={cloudMaterial} color="#ffffff" alphaMap={clouds} transparent depthWrite={false} />
-            </mesh>
+            // Two layers of the same map, offset, roughly double the coverage.
+            <group ref={cloudGroup}>
+              <mesh scale={1.008} material={cloudMaterial}>
+                <sphereGeometry args={[1, 64, 48]} />
+              </mesh>
+              <mesh scale={1.011} rotation={[0, 2.4, 0]} material={cloudMaterial}>
+                <sphereGeometry args={[1, 64, 48]} />
+              </mesh>
+            </group>
           )}
         </group>
       </group>
